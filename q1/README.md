@@ -6,6 +6,49 @@ This document provides a detailed explanation of the `merge_worker.py` implement
 
 The `MergeWorker` class implements a single worker that can operate as either Worker A or Worker B. It uses file-based message passing to communicate with its partner and implements an optimized merge algorithm that leverages range information to minimize comparisons.
 
+---
+
+## Message Types and Their Purpose
+
+We define three message types (each at most 5 characters, values list at most 10 integers):
+
+| Type   | Purpose | Payload |
+|--------|---------|--------|
+| **META** | Exchange range metadata so both workers know each other’s min/max. | `[my_min, my_max]` (2 integers). |
+| **DATA** | Send a chunk of values in the overlapping range for the partner to merge. | Up to 10 integers per message. |
+| **DONE** | Signal that this worker has finished sending all its data. | Empty list. |
+
+- **META** is sent in INIT; once both have exchanged META, we switch to MERGE.
+- **DATA** is used in MERGE to send overlapping-region values in chunks of 10.
+- **DONE** is sent when a worker has no more data to send; the receiver uses it to know when to finish.
+
+---
+
+## Merge Strategy and Why We Chose It
+
+We use a **range-based merge strategy**:
+
+1. **Safe output (no comparisons):** If my value is strictly less than the partner’s minimum (`val < partner_min`), it is globally smallest, so we output it immediately. Both workers do this.
+2. **Overlap handling:** Values in the overlap range `[partner_min, partner_max]` are sent to the partner in **DATA** chunks (up to 10 per message). The partner (Worker B in our design) merges received data with its own and outputs in order.
+3. **Completion:** When a worker has no more local data, it sends **DONE**; when the other has finished merging and received DONE, we transition to DONE.
+
+**Why this strategy:**  
+- For **disjoint ranges** (e.g. A has [0..999], B has [1000..5999]), safe output covers everything with **zero comparisons**.  
+- For **overlapping ranges**, we only do comparisons where needed (merge of overlapping segments), while still avoiding comparisons for the “safe” prefix/suffix.  
+- We chose this over a naive always-merge approach to minimize comparison count and message volume when ranges don’t overlap.
+
+---
+
+## How We Balance Work Between Workers
+
+- **Both workers** do “safe output”: each outputs its own values that are smaller than the partner’s min, so both contribute to the final stream without extra coordination.
+- **Overlapping region:** Worker A sends its overlapping values in DATA chunks; Worker B holds received data and merges it with its own overlapping values. In our implementation, **only Worker B** writes the final merged output (so B does the merge and all appends to the output file). This keeps a single writer and avoids duplicate or out-of-order output.
+- **Chunking:** At most 10 values per DATA message and at most 10 values written per step, so work is spread across steps and no single step does too much I/O.
+
+So: work is balanced by (1) both workers doing safe output, and (2) B handling the merge and output for the overlapping part while A only sends DATA.
+
+---
+
 ## Core Data Structures
 
 ### Message

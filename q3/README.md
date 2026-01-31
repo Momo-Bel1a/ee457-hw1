@@ -122,3 +122,43 @@ Single JSON object:
 ```
 
 After a crash, re-running the test (or your own loop) will reload this state and continue from the next sequence; already-written packets are not re-written thanks to `last_logged_seq` and duplicate checks.
+
+---
+
+## Buffer Size Choice and Reasoning
+
+We use a **single in-memory buffer** implemented as a dict: `buffer: Dict[int, Packet]` keyed by sequence number. There is **no fixed buffer size** (no fixed number of slots or bytes).
+
+- **Reasoning:** Packets can arrive out of order; we must hold any packet that is not yet the next expected one (`last_logged_seq + 1`) until we can form a contiguous run to write. A fixed small buffer could force us to drop packets that are merely late, which would break correctness. An unbounded-by-count buffer keeps all out-of-order packets until they are written or declared lost via gap handling.
+- **Trade-off:** Under heavy loss or extreme reordering, the buffer could grow large. We mitigate this with **gap handling** (see below) so that after a gap we stop waiting for missing sequences and drain what we have.
+
+---
+
+## Flush Strategy (When Do We Write?)
+
+We write to the log in two situations:
+
+1. **On every packet (drain):** After inserting a new packet into the buffer, we call `_drain_buffer()`. This writes **all consecutive** packets starting from `last_logged_seq + 1` that are currently in the buffer. So we write **as soon as** we have the next expected sequence (and any following consecutive ones). No periodic timer; writing is driven by packet arrival and contiguity.
+2. **Periodic gap flush:** The caller (e.g. test script) is expected to call `force_flush(max_gap)` periodically (e.g. every 100 received packets). That does not write by itself on a schedule—it only runs when invoked. When it runs, it may **advance the watermark** and then drain (see gap handling below).
+
+So: we write whenever we have new contiguous data (drain after each packet), and we use periodic `force_flush` to handle gaps so we don’t wait forever for lost packets.
+
+---
+
+## Gap Handling Approach
+
+If we only drained when we had `last_logged_seq + 1`, a single lost packet would block all later packets forever. So we use **gap detection** in `force_flush(max_gap)`:
+
+- If the **smallest** sequence number in the buffer is greater than `last_logged_seq + max_gap`, we treat the range `(last_logged_seq, min_buffered_seq)` as **lost**.
+- We set `last_logged_seq = min_buffered_seq - 1` (so the next expected sequence becomes `min_buffered_seq`), then call `_drain_buffer()` to write all consecutive packets we can, and save state.
+
+So we **skip** missing sequences after a gap of more than `max_gap` (e.g. 10 or 15), and continue writing. This keeps the log ordered by sequence while allowing progress under packet loss.
+
+---
+
+## Trade-offs Observed During Testing
+
+- **Saving state after every packet:** Ensures we can recover from a crash after any packet, but increases disk writes. Trade-off: crash tolerance vs. write volume. We chose tolerance.
+- **Unbounded buffer:** Avoids dropping late-but-valid packets, but under severe loss the buffer can grow. Gap handling limits how long we wait; we accept possible memory growth in exchange for correctness and simplicity.
+- **Gap threshold `max_gap`:** A small `max_gap` (e.g. 10) flushes gaps quickly and keeps buffer smaller but may declare packets lost too early if they are just slow. A larger `max_gap` (e.g. 15) waits longer for late packets but may hold more in memory. In testing, 10–15 worked well for the given traffic.
+- **Write-on-contiguity only:** We never write non-contiguous sequences; gap handling effectively “skips” missing seqs. So the log stays strictly ordered by sequence, but we may have gaps in sequence numbers (missing packets). That is an intentional trade-off: ordered, recoverable log vs. completeness under loss.

@@ -100,7 +100,14 @@ No extra packages are required.
 - **Log file** — Path given to `LoggingResponseHandler`. Each line is a JSON object with `timestamp`, `event`, `url`, and event-specific fields.
 - **`summary.json`** — Written by `fetch_all()` when the handler is `LoggingResponseHandler` (in the current working directory). Contains the summary returned by `get_summary()`.
 
-## Retry and Backoff
+## Retry Strategy
+
+- **When we retry:** We retry only on **5xx** (server error) and on **transport failures** (timeout, connection/network error). We do **not** retry on **4xx** (client error), since those are treated as permanent (e.g. bad request, not found).
+- **Backoff:** Before each retry we wait `base_delay * (2 ** attempt)` seconds (exponential backoff). Example: `base_delay=1.0` → 1s, 2s, 4s for attempts 1–3.
+- **Attempt count:** We allow up to `max_retries` retries (default 3), so at most `max_retries + 1` total attempts per URL. After the last attempt we call `on_max_retries` and return `False`.
+- **Handler hooks:** Each retry is reported via `on_retry(url, attempt, delay_s, error)`; exhaustion is reported via `on_max_retries(url, attempts)`.
+
+## Retry and Backoff (details)
 
 - Only 5xx and transport errors (timeout, connection) are retried.
 - 4xx responses are reported via `on_client_error` and never retried.
